@@ -336,3 +336,49 @@ def test_wrapper_forwards_sigusr1_restart_request_to_child(tmp_path):
 
     assert rc == GATEWAY_SERVICE_RESTART_EXIT_CODE
     assert "restart requested" in log_path.read_text(encoding="utf-8")
+
+
+def test_error_log_rotates_instead_of_growing_without_bound(tmp_path, monkeypatch):
+    """The wrapper outlives any single gateway run, so gateway.error.log has to rotate at the cap:
+    one install reached 56 MB / 741k lines and the real failures were unreadable in it. Mirrors the
+    logs/errors.log policy (5 MB per file, 3 rotations)."""
+    monkeypatch.setattr(stderr_timestamp, "_MAX_BYTES", 4096)
+    monkeypatch.setattr(stderr_timestamp, "_BACKUP_COUNT", 2)
+    log_path = tmp_path / "gateway.error.log"
+    code = "import sys\nfor i in range(300): sys.stderr.write('x' * 78 + '\\n')\n"
+
+    for _ in range(3):
+        assert stderr_timestamp.main(["--error-log", str(log_path), "--", sys.executable, "-c", code]) == 0
+
+    assert log_path.stat().st_size <= 4096
+    assert (tmp_path / "gateway.error.log.1").exists()
+    # backup_count + 1 files in total: the oldest rotation is dropped, never accumulated.
+    assert not (tmp_path / "gateway.error.log.3").exists()
+
+
+def test_oversized_existing_error_log_rolls_over_and_keeps_its_contents(tmp_path):
+    """A log that grew past the cap before this bound existed must be moved aside on the next line
+    rather than appended to forever — and its contents are kept as the first backup, not deleted."""
+    log_path = tmp_path / "gateway.error.log"
+    stale = "old failure line\n" * 100
+    log_path.write_text(stale, encoding="utf-8")
+
+    with stderr_timestamp._BoundedLog(log_path, max_bytes=100, backup_count=1) as log:
+        log.write_line("new failure line\n")
+
+    assert (tmp_path / "gateway.error.log.1").read_text(encoding="utf-8") == stale
+    assert log_path.read_text(encoding="utf-8").endswith("new failure line\n")
+
+
+def test_bounded_log_keeps_at_most_backup_count_rotations(tmp_path):
+    log_path = tmp_path / "gateway.error.log"
+
+    with stderr_timestamp._BoundedLog(log_path, max_bytes=60, backup_count=2) as log:
+        for index in range(20):
+            log.write_line(f"line {index}\n")
+
+    assert sorted(p.name for p in tmp_path.glob("gateway.error.log*")) == [
+        "gateway.error.log",
+        "gateway.error.log.1",
+        "gateway.error.log.2",
+    ]

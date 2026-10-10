@@ -38,20 +38,97 @@ def stamp_line(line: str) -> str:
     return f"{prefix}{rendered}\n"
 
 
+# This wrapper lives for the whole launchd job, so an unrotated error log grows for as long as the
+# gateway runs: one chattery install accumulated a 56 MB / 741k-line gateway.error.log, in which the
+# real failures were buried under repeats of a single warning. Bound it with the same policy
+# hermes_logging applies to logs/errors.log (5 MB per file, 3 rotated backups). Kept stdlib-only
+# because this is a launcher boot file that runs from a source slice.
+_MAX_BYTES = 5 * 1024 * 1024
+_BACKUP_COUNT = 3
+
+
 def _write_timestamped_line(log_file: TextIO, line: str) -> None:
     log_file.write(stamp_line(line))
     log_file.flush()
 
 
-def _open_log(log_path: Path) -> TextIO:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    return log_path.open("a", encoding="utf-8", buffering=1)
+def _rotated_path(log_path: Path, index: int) -> Path:
+    """``gateway.error.log.2``-shaped sibling, matching RotatingFileHandler's naming."""
+    return log_path.with_name(f"{log_path.name}.{index}")
+
+
+def _rotate_log(log_path: Path, backup_count: int) -> None:
+    """Shift ``log_path`` to ``.1`` and its backups down one, dropping the oldest.
+
+    ``backup_count`` of 0 discards the file instead of keeping a rotated copy, so the caller can
+    never end up appending to a file it just decided was too large.
+    """
+    if backup_count <= 0:
+        log_path.unlink(missing_ok=True)
+        return
+    _rotated_path(log_path, backup_count).unlink(missing_ok=True)
+    for index in range(backup_count - 1, 0, -1):
+        source = _rotated_path(log_path, index)
+        if source.exists():
+            source.replace(_rotated_path(log_path, index + 1))
+    log_path.replace(_rotated_path(log_path, 1))
+
+
+class _BoundedLog:
+    """Append-only line writer that rotates *log_path* once it reaches ``max_bytes``.
+
+    A file already past the cap (an install that grew before this bound existed) rolls over on the
+    next line instead of being appended to forever; the oversized file is kept as the first backup
+    rather than deleted, so no log history is destroyed. ``max_bytes``/``backup_count`` default to
+    the module constants at call time so tests can shrink them.
+    """
+
+    def __init__(self, log_path: Path, *, max_bytes: int | None = None, backup_count: int | None = None) -> None:
+        self._path = log_path
+        self._max_bytes = _MAX_BYTES if max_bytes is None else max_bytes
+        self._backup_count = _BACKUP_COUNT if backup_count is None else backup_count
+        self._file: TextIO | None = None
+        self._size = 0
+
+    def __enter__(self) -> "_BoundedLog":
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._reopen()
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        self.close()
+        return False
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+    def _reopen(self) -> None:
+        self._size = self._path.stat().st_size if self._path.exists() else 0
+        self._file = self._path.open("a", encoding="utf-8", buffering=1)
+
+    def write_line(self, line: str) -> None:
+        """Write one stamped line, rolling the file over first when it is at the cap."""
+        rendered = stamp_line(line)
+        width = len(rendered.encode("utf-8"))
+        # Rotate only once something is in the file, so a single line wider than the cap still lands.
+        if self._size and self._size + width > self._max_bytes:
+            self.close()
+            _rotate_log(self._path, self._backup_count)
+        if self._file is None:
+            self._reopen()
+        handle = self._file
+        assert handle is not None  # _reopen() above always leaves a live handle
+        handle.write(rendered)
+        handle.flush()
+        self._size += width
 
 
 def _copy_stderr_with_timestamps(stderr: BinaryIO, log_path: Path) -> None:
-    with _open_log(log_path) as log_file:
+    with _BoundedLog(log_path) as log_file:
         for raw_line in iter(stderr.readline, b""):
-            _write_timestamped_line(log_file, raw_line.decode("utf-8", errors="replace"))
+            log_file.write_line(raw_line.decode("utf-8", errors="replace"))
 
 
 def _copy_stdout_with_timestamps(stdout: BinaryIO) -> None:
@@ -180,8 +257,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             env={**os.environ, **_child_launchd_label_env()},
         )
     except OSError as exc:
-        with _open_log(log_path) as log_file:
-            _write_timestamped_line(log_file, f"failed to start stderr-timestamped command: {exc}")
+        with _BoundedLog(log_path) as log_file:
+            log_file.write_line(f"failed to start stderr-timestamped command: {exc}")
         return 127
 
     assert proc.stdout is not None and proc.stderr is not None
